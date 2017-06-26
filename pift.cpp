@@ -32,7 +32,6 @@
  *
  **********************************************************************/
 #include "pift.h"
-#include "omp.h"
 
 #include <pcl/ModelCoefficients.h>
 #include <pcl/sample_consensus/method_types.h>
@@ -42,6 +41,10 @@
 #include <pcl/segmentation/sac_segmentation.h>
 #include <pcl/features/fpfh.h>
 
+//#define USE_OPENMP
+#ifdef USE_OPENMP
+#include "omp.h"
+#endif
 ColorCoding::ColorCoding(const METHOD &_method)
     : method_(_method)
 {
@@ -576,7 +579,7 @@ PerspectiveInvariantFeature::BeehiveMask::getCellID(const uint& _xp, const uint&
 PerspectiveInvariantFeature::PerspectiveInvariantFeature(const uint _max_keypoints, const uint _spatial_radius, const DESCRIPTOR_TYPE _method)
     : PATCH_SIZE(40*2+1), MAX_KEYPOINTS(_max_keypoints), SPATIAL_R(_spatial_radius)
 {
-    DRAW_IMAG = true;
+    DRAW_IMAG = false;
     annular_mask_ = boost::shared_ptr<AnnularMask> ( new AnnularMask( PATCH_SIZE, 12, 4 ) );
     beehive_mask_ = boost::shared_ptr<BeehiveMask> ( new BeehiveMask( PATCH_SIZE, 6 ) );
     patch_type_ = _method;// D_TYPE_BEEHIVE D_TYPE_BEEHIVE_NOOB D_TYPE_BRIEF D_TYPE_ORB D_TYPE_SURF D_TYPE_HISTOGRAM
@@ -603,13 +606,18 @@ PerspectiveInvariantFeature::PerspectiveInvariantFeature(const uint _max_keypoin
     _256_camera_fx = 256.0/camera_fx;
     _256_camera_fy = 256.0/camera_fy;
 
+    W2P_RATIO_256 = double(PATCH_SIZE/2+0.5)/(double)SPATIAL_R * 256;// World to Pixel transformation: mm->pixel (with the sacle of 256)
+    blur_r_.resize(128);         //The depth is down sampled by the step of 100mm, and with the maximum range of 128*100mm
+    for(uint i=0; i<blur_r_.size(); i++)
+        blur_r_[i] = (i*100+99)*hypot(_1_camera_fx,_1_camera_fy) * W2P_RATIO_256/256  * 2 + 1;
+
     keypoints_filtered_.reserve( MAX_KEYPOINTS );
     keypoints_3D_.reserve(MAX_KEYPOINTS);
     features_show_   .create( 10*PATCH_SIZE, 10*PATCH_SIZE, CV_8UC4);//show 10*10 patches in total
     features_restore_.create( 10*PATCH_SIZE, 10*PATCH_SIZE, CV_8UC4);
 }
 
-uint PerspectiveInvariantFeature::calcPt6d(const cv::Point& _pt, cv::Point3f &_pt3d, cv::Vec4d &_plane_coef, double &_plane_err )
+uint PerspectiveInvariantFeature::calcPt6d(const cv::Point& _pt, cv::Point3f &_pt3d, cv::Vec4d &_plane_coef, double &_plane_err ) const
 {//_plan_coef: Ax+By+Cz=D; return num of pixels
 
     const bool SHOW_TIME_INFO = false;
@@ -633,10 +641,11 @@ uint PerspectiveInvariantFeature::calcPt6d(const cv::Point& _pt, cv::Point3f &_p
     uchar *pdata;
     uint point_num = 0;
     uint depth_uchar;
-    for(size_t i =0; i<r_nearest*2+1; i++)
+    const uint d_nearest = r_nearest*2+1;
+    for(size_t i =0; i<d_nearest; i++)
     {
         pdata = nearest_roi.data + i*nearest_roi.step[0];
-        for(size_t j=0; j<r_nearest*2+1; j++)
+        for(size_t j=0; j<d_nearest; j++)
         {
             const u_int16_t &depth_current = *(u_int16_t*)pdata;
             depth_uchar = depth_current>=DEPTH_MAX ? 0 : depth_current/HIST_RESOLUTION;
@@ -736,7 +745,8 @@ uint PerspectiveInvariantFeature::calcPt6d(const cv::Point& _pt, cv::Point3f &_p
 }
 
 uint
-PerspectiveInvariantFeature::warpPerspectivePatch( const cv::Point3f &_pt3d, const cv::Vec4d _plane_coef , cv::Mat &_feature_patch, const uint &SPATIAL_RADIUS)
+PerspectiveInvariantFeature::warpPerspectivePatch( const cv::Point& _pt2d, const cv::Point3f &_pt3d, const cv::Vec4d _plane_coef , cv::Mat &_feature_patch)
+const
 {
     assert( _feature_patch.cols == PATCH_SIZE && _feature_patch.rows == PATCH_SIZE );
     assert( _feature_patch.channels()==4 );
@@ -749,6 +759,8 @@ PerspectiveInvariantFeature::warpPerspectivePatch( const cv::Point3f &_pt3d, con
         gettimeofday(&timel,NULL);
         time0 = timel;
     }
+    const int PATCH_R = PATCH_SIZE/2;
+    const int SPATIAL_R2 = SPATIAL_R*SPATIAL_R;
 
     /// 1. Calculate the perspective projection matrix
     cv::Mat_<double> rotat_mat(3,3);
@@ -784,37 +796,34 @@ PerspectiveInvariantFeature::warpPerspectivePatch( const cv::Point3f &_pt3d, con
 /*/
 
     /// 2. Perspective projection from 3D to 2D
-    pcl::PointXYZRGB center3d;
-    center3d.x = _pt3d.x, center3d.y = _pt3d.y, center3d.z = _pt3d.z;
-    std::vector<int> pointIndicesOut;
-    std::vector<float> pointRadiusSquaredDistance;
-    kdtree_.radiusSearch( center3d, SPATIAL_RADIUS, pointIndicesOut, pointRadiusSquaredDistance );//std::max(cos(rotat_angle),0.5)
-    int neighbor_num = pointIndicesOut.size();
-    if(SHOW_TIME_INFO)
-    {
-        gettimeofday(&timen,NULL);
-        std::cout << "  Search " << neighbor_num << "pts in " << (timen.tv_sec-timel.tv_sec)*1000+(timen.tv_usec-timel.tv_usec)/1000.0 << "ms";
-        timel = timen;
-    }
     int total_num = 0;
-    int W2P_RATIO_256 = double(PATCH_SIZE/2+0.5)/(double)SPATIAL_RADIUS * 256;// World to Pixel transformation: mm->pixel (with the sacle of 256)
-    std::vector<int> pixel_radius_table;    //A 3D point is projected to the 2D image with a specified 2D size, which relates to the depth.
-    pixel_radius_table.resize(128);         //The depth is down sampled by the step of 100mm, and with the maximum range of 128*100mm
-    for(uint i=0; i<pixel_radius_table.size(); i++)
-        pixel_radius_table[i] = (i*100+99)*hypot(_1_camera_fx,_1_camera_fy) * W2P_RATIO_256/256;
-    const uint PATCH_R = PATCH_SIZE/2;
-    const uint PATCH_R2 = PATCH_R*PATCH_R;
-    cv::Mat_<int> z_mask( PATCH_SIZE, PATCH_SIZE, -(int)SPATIAL_RADIUS );
-    cv::Mat_<int> grow_mask( PATCH_SIZE, PATCH_SIZE, 0 );
-    for(int i=0; i< neighbor_num; i++)
+    cv::Mat_< cv::Vec<int,5> > patch_blur( PATCH_SIZE, PATCH_SIZE, cv::Vec<int, 5>(0,0,0,0,-SPATIAL_R*2) );//r,g,b,weight,proj_z
+    int hints_r = SPATIAL_R * camera_fx / _pt3d.z;
+    int start_x = _pt2d.x-hints_r, end_x = _pt2d.x+hints_r;
+    int start_y = _pt2d.y-hints_r, end_y = _pt2d.y+hints_r;
+    if( start_x<0 ) start_x = 0;
+    if( start_y<0 ) start_y = 0;
+    if( end_x>=width ) end_x = width-1;
+    if( end_y>=height ) end_y = height-1;
+    int ind_row = start_y*width + start_x;
+    for(int y=start_y; y<=end_y; y++)
     {
-        pcl::PointXYZRGB &cur_point = cloud_->at(pointIndicesOut[i]);
-        int xn = cur_point.x - center3d.x + 0.5;
-        int yn = cur_point.y - center3d.y + 0.5;
-        int zn = cur_point.z - center3d.z + 0.5;
-        int proj_x = ( xn*rotat_mat32S256(0,0) + yn*rotat_mat32S256(0,1) + zn*rotat_mat32S256(0,2) ) / 256;
-        int proj_y = ( xn*rotat_mat32S256(1,0) + yn*rotat_mat32S256(1,1) + zn*rotat_mat32S256(1,2) ) / 256;
-        int proj_z = ( xn*rotat_mat32S256(2,0) + yn*rotat_mat32S256(2,1) + zn*rotat_mat32S256(2,2) ) / 256;
+    int ind = ind_row;
+    ind_row += width;
+    for(int x=start_x; x<=end_x; x++)
+    {
+        const pcl::PointXYZRGB cur_point = cloud_->at(ind);
+        ind ++;
+        cv::Vec3i ptn( cur_point.x-_pt3d.x, cur_point.y-_pt3d.y, cur_point.z-_pt3d.z );
+        if( ptn.dot(ptn)>SPATIAL_R2 )
+            continue;
+
+        const int xn = cur_point.x - _pt3d.x + 0.5;
+        const int yn = cur_point.y - _pt3d.y + 0.5;
+        const int zn = cur_point.z - _pt3d.z + 0.5;
+        const int proj_x = ( xn*rotat_mat32S256(0,0) + yn*rotat_mat32S256(0,1) + zn*rotat_mat32S256(0,2) ) / 256;
+        const int proj_y = ( xn*rotat_mat32S256(1,0) + yn*rotat_mat32S256(1,1) + zn*rotat_mat32S256(1,2) ) / 256;
+        const int proj_z = ( xn*rotat_mat32S256(2,0) + yn*rotat_mat32S256(2,1) + zn*rotat_mat32S256(2,2) ) / 256;
 
         ///test
 //        if( proj_x!=0 && proj_y!=0 )
@@ -831,52 +840,69 @@ PerspectiveInvariantFeature::warpPerspectivePatch( const cv::Point3f &_pt3d, con
 //         cur_color = cur_color + 127;
 //        cur_color = cur_color<<16 | cur_color<<8 | cur_color<<0;
 
-        int x_pixel = proj_x * W2P_RATIO_256 /256;
-        int y_pixel = proj_y * W2P_RATIO_256 /256;
-        x_pixel += PATCH_R, y_pixel += PATCH_R;
-        uint id_r = std::min( (uint)cur_point.z/100, (uint)pixel_radius_table.size()-1 );
-        int& pixel_r = pixel_radius_table[id_r];
-        const int blur_r = pixel_r * 2 + 1;//radius for blur
-        int min_px = x_pixel-blur_r, max_px = x_pixel+blur_r;
-        int min_py = y_pixel-blur_r, max_py = y_pixel+blur_r;
-        for(int y=min_py; y<=max_py; y++)
-        if( y>=0 && y<(int)PATCH_SIZE )
+        const int x_pixel = proj_x * W2P_RATIO_256 /256 + PATCH_R;
+        const int y_pixel = proj_y * W2P_RATIO_256 /256 + PATCH_R;
+
+       /// feature-patch blur
+        const uint id_r = std::min( (uint)cur_point.z/100, (uint)blur_r_.size()-1 );
+        const int blur_r = blur_r_[id_r];
+        int start_x = x_pixel-blur_r, end_x = x_pixel+blur_r;
+        int start_y = y_pixel-blur_r, end_y = y_pixel+blur_r;
+        if( start_x<0 ) start_x = 0;
+        if( start_y<0 ) start_y = 0;
+        if( end_x>=PATCH_SIZE ) end_x = PATCH_SIZE-1;
+        if( end_y>=PATCH_SIZE ) end_y = PATCH_SIZE-1;
+        uchar* p_row =  patch_blur.data + start_y*patch_blur.step[0] + start_x*patch_blur.step[1];
+        for(int y=start_y; y<=end_y; y++)
         {
-            uchar *p_patch = _feature_patch.data + y*_feature_patch.step[0] + min_px*_feature_patch.step[1];
-            uchar *p_z_mask=         z_mask.data + y*        z_mask.step[0] + min_px*        z_mask.step[1];
-            uchar *p_grow_mask  = grow_mask.data + y*     grow_mask.step[0] + min_px*     grow_mask.step[1];
-            for(int x=min_px; x<=max_px; x++)
+            int *p_pixel = (int*)p_row;
+            for(int x=start_x; x<=end_x; x++)
             {
-                uchar &r = p_patch[2], &g = p_patch[1], &b = p_patch[0];
-                const int blur_weight1 = ( blur_r+1 - abs(x-x_pixel) ) * ( blur_r+1 - abs(y-y_pixel) );
-                const int blur_weight2 = *(int*)p_grow_mask;
-                if( x>=0 && x<(int)PATCH_SIZE )
-                if( (x-PATCH_R)*(x-PATCH_R)+(y-PATCH_R)*(y-PATCH_R) <= (int)PATCH_R2 )
+                int &r = p_pixel[2], &g = p_pixel[1], &b = p_pixel[0];
+                int &w = p_pixel[3], &z = p_pixel[4];
+                if( proj_z > z + SPATIAL_R/16 )//The nearer point replaces the farer point
                 {
-                    if( *(int*)p_z_mask==-(int)SPATIAL_RADIUS || proj_z > *(int*)p_z_mask + SPATIAL_RADIUS*0.1 )//The nearer point replaces the farer point
-                    {
-                        r = cur_point.r;
-                        g = cur_point.g;
-                        b = cur_point.b;
-                        *(int*)p_z_mask = proj_z;
-                        *(int*)p_grow_mask += blur_weight1;
-                    }
-                    else//blur
-                    {
-                        r = ( cur_point.r*blur_weight1 + r*blur_weight2) / (blur_weight1+blur_weight2);
-                        g = ( cur_point.g*blur_weight1 + g*blur_weight2) / (blur_weight1+blur_weight2);
-                        b = ( cur_point.b*blur_weight1 + b*blur_weight2) / (blur_weight1+blur_weight2);
-                        if( *(int*)p_z_mask < proj_z )
-                            *(int*)p_z_mask = proj_z;
-                        *(int*)p_grow_mask += blur_weight1;
-                    }
+                    r = cur_point.r;
+                    g = cur_point.g;
+                    b = cur_point.b;
+                    z = proj_z;
+                    w = 1;
                 }
-                p_patch    += _feature_patch.step[1];
-                p_z_mask   += z_mask.step[1];
-                p_grow_mask+= grow_mask.step[1];
+                else//blur
+                {
+                    r += cur_point.r;
+                    g += cur_point.g;
+                    b += cur_point.b;
+                    if( z < proj_z )
+                        z = proj_z;
+                    w ++;
+                }
+                p_pixel += 5; // five channels of integer
             }
+            p_row += patch_blur.step[0];
         }
         total_num ++;
+    }
+    }
+    uchar* p_row_blur =  patch_blur.data;
+    uchar* p_row_patch =  _feature_patch.data;
+    for(int y=0; y<PATCH_SIZE; y++)
+    {
+        int *p_blur = (int*)p_row_blur;
+        uchar *p_patch = p_row_patch;
+        for(int x=0; x<PATCH_SIZE; x++)
+        {
+            int &r = p_blur[2], &g = p_blur[1], &b = p_blur[0];
+            int &w = p_blur[3], &z = p_blur[4];
+            if( w==1 )
+                p_patch[0] = b, p_patch[1] = g, p_patch[2] = r;
+            else if( w!=0 )
+                p_patch[0] = b/w, p_patch[1] = g/w, p_patch[2] = r/w;
+            p_blur  += 5; // five channels of integer
+            p_patch += 4; // four channels of byte
+        }
+        p_row_blur += patch_blur.step[0];
+        p_row_patch += _feature_patch.step[0];
     }
 
     if(SHOW_TIME_INFO)
@@ -885,11 +911,12 @@ PerspectiveInvariantFeature::warpPerspectivePatch( const cv::Point3f &_pt3d, con
         std::cout << " Project "  << total_num << "pts in " << (timen.tv_sec-timel.tv_sec)*1000+(timen.tv_usec-timel.tv_usec)/1000.0 << "ms.";
         std::cout << " Totla:" << (timen.tv_sec-time0.tv_sec)*1000+(timen.tv_usec-time0.tv_usec)/1000.0<<"ms"<<std::endl;
     }
-    return neighbor_num;
+    return total_num;
 }
 
 uint
-PerspectiveInvariantFeature::sampleCubeEvenly( const cv::Point3f &_pt3d, const cv::Vec4d _plane_coef , std::vector<cv::Vec3i> & _cube, const uint &SPATIAL_RADIUS, const double &_main_angle )
+PerspectiveInvariantFeature::sampleCubeEvenly( const cv::Point3f &_pt3d, const cv::Vec4d _plane_coef , std::vector<cv::Vec3i> & _cube, const double &_main_angle )
+const
 {
     const uint LAYERS = 3;
     ///Calculate perspective projection matrix
@@ -920,7 +947,7 @@ PerspectiveInvariantFeature::sampleCubeEvenly( const cv::Point3f &_pt3d, const c
     center3d.x = _pt3d.x, center3d.y = _pt3d.y, center3d.z = _pt3d.z;
     std::vector<int> pointIndicesOut;
     std::vector<float> pointRadiusSquaredDistance;
-    kdtree_.radiusSearch( center3d, SPATIAL_RADIUS, pointIndicesOut, pointRadiusSquaredDistance );///std::max(cos(rotat_angle),0.5)
+    kdtree_.radiusSearch( center3d, SPATIAL_R, pointIndicesOut, pointRadiusSquaredDistance );///std::max(cos(rotat_angle),0.5)
     int neighbor_num = pointIndicesOut.size();
 
     uint valid_cubes = 0;
@@ -933,9 +960,9 @@ PerspectiveInvariantFeature::sampleCubeEvenly( const cv::Point3f &_pt3d, const c
         long proj_x = ( xn*rotat_mat32S256(0,0) + yn*rotat_mat32S256(0,1) + zn*rotat_mat32S256(0,2) ) / 256;
         long proj_y = ( xn*rotat_mat32S256(1,0) + yn*rotat_mat32S256(1,1) + zn*rotat_mat32S256(1,2) ) / 256;
         long proj_z = ( xn*rotat_mat32S256(2,0) + yn*rotat_mat32S256(2,1) + zn*rotat_mat32S256(2,2) ) / 256;
-        int cube_idx = (proj_x+SPATIAL_RADIUS) * BORDER_LENGTH / (SPATIAL_RADIUS*2+1);
-        int cube_idy = (proj_y+SPATIAL_RADIUS) * BORDER_LENGTH / (SPATIAL_RADIUS*2+1);
-        int cube_idz = (proj_z+SPATIAL_RADIUS) * BORDER_LENGTH / (SPATIAL_RADIUS*2+1);
+        int cube_idx = (proj_x+SPATIAL_R) * BORDER_LENGTH / (SPATIAL_R*2+1);
+        int cube_idy = (proj_y+SPATIAL_R) * BORDER_LENGTH / (SPATIAL_R*2+1);
+        int cube_idz = (proj_z+SPATIAL_R) * BORDER_LENGTH / (SPATIAL_R*2+1);
         assert( cube_idx<BORDER_LENGTH && cube_idy<BORDER_LENGTH && cube_idz<BORDER_LENGTH );
         int cube_id = cube_idz*BORDER_LENGTH*BORDER_LENGTH + cube_idy*BORDER_LENGTH + cube_idx;
         _cube[ cube_id ] += cv::Vec3i( cur_point.r, cur_point.g, cur_point.b );
@@ -1211,7 +1238,9 @@ PerspectiveInvariantFeature::prepareFrame( const cv::Mat _rgb_image, const cv::M
         cloud_->width = width;
         cloud_->height= height;
     }
+    #ifdef USE_OPENMP
     #pragma omp parallel for
+    #endif
     for( int y = 0; y < (int)height; ++y )
     {
         uchar *prgb   = _rgb_image.data + y*_rgb_image.step[0];
@@ -1272,7 +1301,10 @@ PerspectiveInvariantFeature::process( std::vector<cv::KeyPoint> &m_keypoints )
 
     uint keypoint_valid_cnt =0;
     uint fake_point_cnt[3] = {0};
-//#pragma omp parallel for
+
+    #ifdef USE_OPENMP
+    #pragma omp parallel for
+    #endif
     for( int key_id = 0; key_id < (int)m_keypoints.size() && keypoint_valid_cnt < MAX_KEYPOINTS; key_id++)
     {
         cv::Point2f keypoint2d = m_keypoints[key_id].pt;
@@ -1285,8 +1317,7 @@ PerspectiveInvariantFeature::process( std::vector<cv::KeyPoint> &m_keypoints )
         cur_patch = cv::Mat::zeros( PATCH_SIZE, PATCH_SIZE, CV_8UC4 );
 
         uint front_pt_num;
-//#pragma omp critical
-        front_pt_num = calcPt6d( keypoint2d, keypoint3d, plan_coef, plane_err );
+        front_pt_num = calcPt6d( keypoint2d, keypoint3d, plan_coef, plane_err );//0.03ms
         if( !front_pt_num  )
         {
             fake_point_cnt[0] ++;
@@ -1295,11 +1326,10 @@ PerspectiveInvariantFeature::process( std::vector<cv::KeyPoint> &m_keypoints )
             continue;
         }
 
-        uint spatial_r = SPATIAL_R;
 //        float &r = m_keypoints[key_id].size;
 //        if( r != 0 )
 //            spatial_r = r * _1_camera_fx * keypoint3d.z;
-        warpPerspectivePatch( keypoint3d, plan_coef, cur_patch, spatial_r );
+        warpPerspectivePatch( keypoint2d, keypoint3d, plan_coef, cur_patch );
         if( 0)//fabs(plan_coef[2]) < sin(M_PI/20) && keypoint3d.z>1000 )//Steep surface
         {
             fake_point_cnt[1] ++;
@@ -1323,12 +1353,12 @@ PerspectiveInvariantFeature::process( std::vector<cv::KeyPoint> &m_keypoints )
         double main_dir_rad = main_dir_vec.x==0 ? (main_dir_vec.y>0?M_PI_2:3*M_PI_2) : atan( main_dir_vec.y / main_dir_vec.x );
         if( main_dir_vec.x<0 ) main_dir_rad += M_PI;
         if( main_dir_rad<0 ) main_dir_rad += 2*M_PI;
-        double main_dir_deg = main_dir_rad*180.0/M_PI;
+        double main_dir_deg = main_dir_rad*(180.0/M_PI);
 
         std::vector<cv::Vec3i> cube3;
         if( patch_type_ == D_TYPE_CUBE3 )
         {
-            sampleCubeEvenly( keypoint3d, plan_coef, cube3, spatial_r, 0 );
+            sampleCubeEvenly( keypoint3d, plan_coef, cube3, 0 );
             std::cout << "cube size=" << cube3.size();
             cube3 = PyramidCube( cube3 );
             std::cout << " ->" << cube3.size() << std::endl;
@@ -1443,7 +1473,9 @@ PerspectiveInvariantFeature::process( std::vector<cv::KeyPoint> &m_keypoints )
             break;
         }
         /// 3. Save the descriptor into the matrix
+        #ifdef USE_OPENMP
         #pragma omp critical
+        #endif
         {
         if( keypoint_valid_cnt < MAX_KEYPOINTS )
         {
@@ -1626,52 +1658,52 @@ PerspectiveInvariantFeature::restore_descriptor(const cv::Mat& _descriptor)
 }
 
 CV_WRAP void
-PIFTMatcher::matchDescriptors( const cv::Mat& queryDescriptors, const cv::Mat& trainDescriptors, CV_OUT std::vector<cv::DMatch>& matches ) const
+PIFTMatcher::matchDescriptors( const cv::Mat& _queryDescriptors, const cv::Mat& _trainDescriptors, CV_OUT std::vector<std::vector<cv::DMatch> >& _matches ) const
 {
-    matches.clear();
-    matches.reserve( queryDescriptors.rows );
-    uchar *p_from = queryDescriptors.data;
-    for(int id_from=0; id_from<queryDescriptors.rows; id_from++ )
+    std::vector<cv::DMatch> matches_temp;
+    matches_temp.reserve( _queryDescriptors.rows );
+    uchar *p_from = _queryDescriptors.data;
+    for(int id_from=0; id_from<_queryDescriptors.rows; id_from++ )
     {
         uint min_dist = INFINITY;
         int min_id = -1;
-        uchar *p_to =  trainDescriptors.data;
-        for(int id_to=0; id_to<trainDescriptors.rows; id_to++ )
+        uchar *p_to =  _trainDescriptors.data;
+        for(int id_to=0; id_to<_trainDescriptors.rows; id_to++ )
         {
-            uint temp_dist = color_encoder_.machCode( p_from, p_to, trainDescriptors.cols );
+            uint temp_dist = color_encoder_.machCode( p_from, p_to, _trainDescriptors.cols );
             if( temp_dist < min_dist )
             {
                 min_dist = temp_dist;
                 min_id = id_to;
             }
-            p_to += trainDescriptors.step[0];
+            p_to += _trainDescriptors.step[0];
         }
         if( min_id != -1 )
-            matches.push_back( cv::DMatch( id_from, min_id, min_dist) );
-        p_from += queryDescriptors.step[0];
+            matches_temp.push_back( cv::DMatch( id_from, min_id, min_dist) );
+        p_from += _queryDescriptors.step[0];
     }
-    ///cross check
-    if( cross_check_ )
-    for( std::vector<cv::DMatch>::iterator p_match = matches.begin(); p_match != matches.end();  )
+
+    _matches.reserve( matches_temp.size() );
+    for( std::vector<cv::DMatch>::iterator p_match = matches_temp.begin(); p_match != matches_temp.end();  )
     {
-        uchar *p_to =  trainDescriptors.data + p_match->trainIdx * trainDescriptors.step[0];
+        uchar *p_to =  _trainDescriptors.data + p_match->trainIdx * _trainDescriptors.step[0];
         uint min_dist = p_match->distance;
         bool reject = false;
-        uchar *p_from =  queryDescriptors.data;
-        for(int id_from=0; id_from<queryDescriptors.rows; id_from++ )
+        uchar *p_from =  _queryDescriptors.data;
+        if( cross_check_ )///cross check
+        for(int id_from=0; id_from<_queryDescriptors.rows; id_from++ )
         {
             if( id_from != p_match->queryIdx )
-            if( min_dist >= color_encoder_.machCode( p_to, p_from, queryDescriptors.cols ) )
+            if( min_dist >= color_encoder_.machCode( p_to, p_from, _queryDescriptors.cols ) )
             {
                 reject = true;
                 break;
             }
-            p_from += queryDescriptors.step[0];
+            p_from += _queryDescriptors.step[0];
         }
-        if( reject )
-            p_match = matches.erase( p_match );
-        else
-            p_match ++;
+        if( !reject )
+            _matches.push_back( std::vector<cv::DMatch>( 1,*p_match ) );
+        p_match ++;
     }
 }
 
@@ -1696,14 +1728,7 @@ void PIFTMatcher::knnMatchImpl( const cv::Mat& queryDescriptors, std::vector<std
         return;
     }
     CV_Assert( queryDescriptors.type() == trainDescCollection[0].type() );
-
-    std::vector<cv::DMatch> match_temp;
-    matchDescriptors( queryDescriptors, trainDescCollection[0], match_temp );
-
-    matches.resize(match_temp.size(), std::vector<cv::DMatch>(1) );
-    std::vector<cv::DMatch>::iterator it_temp = match_temp.begin();
-    for( std::vector<std::vector<cv::DMatch> >::iterator it=matches.begin(); it!=matches.end(); it++ )
-        (*it)[0] = *it_temp++;
+    matchDescriptors( queryDescriptors, trainDescCollection[0], matches );
 }
 
 

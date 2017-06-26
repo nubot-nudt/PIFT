@@ -5,6 +5,7 @@
 #include <sstream>
 
 #include "pift.h"
+#include "brand.h"
 #include "datasetplayer.hpp"
 #include "visualodometry.hpp"
 #include "transformprocess.hpp"
@@ -71,6 +72,8 @@ int main(int argc, char **argv)
         DT_FREAK,
         DT_ORB,
         DT_FPFH,
+        DT_CSHOT,
+        DT_BRAND,
         DT_PIFT,
         DT_DEFAULT
     }descriptor_type = DT_PIFT;
@@ -107,6 +110,10 @@ int main(int argc, char **argv)
             descriptor_type = DT_FREAK;
         else if(strcmp(argv[i], "fpfh") == 0 )
             descriptor_type = DT_FPFH;
+        else if(strcmp(argv[i], "cshot") == 0 )
+            descriptor_type = DT_CSHOT;
+        else if(strcmp(argv[i], "brand") == 0 )
+            descriptor_type = DT_BRAND;
     }
 
 //    cv::StarDetector StarDetector;
@@ -118,7 +125,9 @@ int main(int argc, char **argv)
     cv::BRISK BRISK;
     cv::FREAK FreakExtractor;
     cv::ORB ORB;
+    BrandDescriptorExtractor brand;
     PerspectiveInvariantFeature pift( max_key_ponts, spatial_radius, PIFT_TYPE );
+    pift.setDrawResults( true );
 
     cv::Mat rgb_last;
     pcl::PointCloud<pcl::PointXYZRGB> cloud_last;
@@ -139,6 +148,8 @@ int main(int argc, char **argv)
 //    viewer_norm.setCameraPosition(0,-1500,-1000, 0,0,2000, 0,-1,0);
     pcl::visualization::PCLVisualizer viewer_reg("reg_tf");
     viewer_reg .setCameraPosition(0,-1500,-1000, 0,0,2000, 0,-1,0);
+    viewer_reg .setPosition(0,0);
+    viewer_reg .setSize(1440,900);
 
     cv::VideoWriter match_video;
     cv::VideoWriter reg_video;
@@ -159,7 +170,6 @@ int main(int argc, char **argv)
                << std::right<<std::setw(10) << "TransErr"
                << std::right<<std::setw(10) << "CameTrans";
     result_file << result_str.str() << std::endl;
-    std::cout   << result_str.str() << std::endl;
     result_str.str("");
     result_str.setf( std::ios::fixed );
     result_str.precision(4);
@@ -177,15 +187,17 @@ int main(int argc, char **argv)
         else
             p_matcher = new PIFTMatcher( pift.color_encoder_.method_, true );
         break;
-    case DT_SURF:
-    case DT_FPFH:
-        p_matcher = new cv::BFMatcher(cv::NORM_L2, true);
-        break;
     case DT_BRIEF:
     case DT_BRISK:
     case DT_FREAK:
     case DT_ORB:
+    case DT_BRAND:
         p_matcher = new cv::BFMatcher(cv::NORM_HAMMING, true);
+        break;
+    case DT_SURF:
+    case DT_FPFH:
+    case DT_CSHOT:
+        p_matcher = new cv::BFMatcher(cv::NORM_L2, true);
         break;
     default:
         return -1;
@@ -204,8 +216,12 @@ int main(int argc, char **argv)
     Eigen::Quaternionf         GT_PosR;
     Eigen::Vector3f            GT_PosT;
     if( START_FRAME > 1)
-    for( int data_cnt=1; data_reader.getFrame( rgb, depth, GT_PosR, GT_PosT, &time_stamp ); data_cnt++ )
-        if( data_cnt >= START_FRAME ) break;
+    {
+        std::cout << "Skiping frames " << START_FRAME << ". Please wait ..." << std::endl;
+        for( int data_cnt=1; data_reader.getFrame( rgb, depth, GT_PosR, GT_PosT, &time_stamp ); data_cnt++ )
+            if( data_cnt >= START_FRAME ) break;
+    }
+    std::cout   << result_str.str() << std::endl;
     for( int data_cnt=1; data_reader.getFrame( rgb, depth, GT_PosR, GT_PosT, &time_stamp ) && data_cnt<=TOTAL_FRAMES; data_cnt++ )
     {
         GT_Pos7[0] = GT_PosR.w();//angle
@@ -256,6 +272,8 @@ int main(int argc, char **argv)
             continue;
         }
 
+        timeval time_start;
+        gettimeofday(&time_start,NULL);
         switch (descriptor_type)
         {
         case DT_SURF:
@@ -275,20 +293,54 @@ int main(int argc, char **argv)
             break;
         case DT_FPFH:
         {
-            pift.prepareFrame( rgb, depth );
-            descriptors = Tf::extractFPFH( keypoints, pift.cloud_ );
+            descriptors = Tf::extractFPFH( keypoints, pift.cloud_, &time_start );
+        }
+            break;
+        case DT_CSHOT:
+        {
+            descriptors = Tf::extractCSHOT( keypoints, pift.cloud_, &time_start );
+        }
+            break;
+        case DT_BRAND:
+        {
+            cv::Mat cloud( depth.size(), CV_32FC3 );
+            for( int y = 0; y < cloud.rows; y++ )
+            {
+                cv::Point3f* cloud_ptr = (cv::Point3f*)cloud.ptr(y);
+
+                for( int x = 0; x < cloud.cols; x++ )
+                {
+                    pcl::PointXYZRGB pt = pift.cloud_->at(x,y);
+                    cloud_ptr[x].x = pt.x * 0.001; // meters
+                    cloud_ptr[x].y = pt.y * 0.001;
+                    cloud_ptr[x].z = pt.z * 0.001;
+                }
+            }
+            cv::Mat normals( cloud.size(), CV_32FC3 );
+            for(int y = 0; y < pift.normals_->height; ++y)
+            for(int x = 0; x < pift.normals_->width; ++x)
+            {
+               normals.at<cv::Point3f>(y,x).x = pift.normals_->at(x,y).normal_x;
+               normals.at<cv::Point3f>(y,x).y = pift.normals_->at(x,y).normal_y;
+               normals.at<cv::Point3f>(y,x).z = pift.normals_->at(x,y).normal_z;
+            }
+            gettimeofday(&time_start,NULL);
+            brand.compute( rgb, cloud, normals, keypoints, descriptors );
         }
             break;
         case DT_PIFT:
-            pift.prepareFrame( rgb, depth );
             descriptors = pift.process( keypoints );
-            pift.restore_descriptor( descriptors );
             break;
         default:
-            pift.prepareFrame( rgb, depth );
             descriptors = pift.processFPFH( keypoints );
             break;
         }
+        timeval time_end;
+        gettimeofday(&time_end,NULL);
+        int time_cost = (time_end.tv_sec-time_start.tv_sec)*1000+(time_end.tv_usec-time_start.tv_usec)/1000;
+        if( RESTORE_PATCH )
+            pift.restore_descriptor( descriptors );
+
         if( keypoints.size()<3 )
         {
             std::cerr << "Too few key points!!! = " << keypoints.size() << std::endl;
@@ -353,6 +405,7 @@ int main(int argc, char **argv)
                        << std::right<<std::setw(10) << (pos-pos_GT).norm() << " "
                        << std::right<<std::setw(10) << pos_GT.norm();
             result_file << result_str.str() << std::endl;
+            result_str << "  time=" << keypoints.size() << "*" << double(time_cost)/keypoints.size();
             if( pos.norm() == 0 )
                 std::cout << "\033[33m" << result_str.str() << "\033[m" << std::endl;
             else
@@ -449,7 +502,8 @@ int main(int argc, char **argv)
         if( data_cnt==1 )
         {
             cv::imshow("img_matches_patch"  ,pift.features_show_);
-            cv::imshow("img_matches_restore",pift.features_restore_);
+            if( RESTORE_PATCH )
+                cv::imshow("img_matches_restore",pift.features_restore_);
         }
         else
         {
@@ -606,7 +660,8 @@ int main(int argc, char **argv)
             keypoints3_last = keypoints3;
             descriptors_last = descriptors.clone();
             features_show_last = pift.features_show_.clone();
-            features_restore_last = pift.features_restore_.clone();
+            if( RESTORE_PATCH )
+                features_restore_last = pift.features_restore_.clone();
             GT_Pos7_last = GT_Pos7;
         }
     }

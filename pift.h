@@ -142,10 +142,11 @@ public:
 
     PerspectiveInvariantFeature(const uint _max_keypoints=200, const uint _spatial_radius=100, const DESCRIPTOR_TYPE _method=D_TYPE_BEEHIVE);
     bool prepareFrame( const cv::Mat _rgb_image, const cv::Mat _depth_16U );
+    void setDrawResults( const bool _draw_result=false ){ DRAW_IMAG = _draw_result; }
 
-    uint calcPt6d(const cv::Point& _pt, cv::Point3f &_pt3d, cv::Vec4d &_plane_coef, double &_plane_err );
-    uint warpPerspectivePatch( const cv::Point3f &_pt3d, const cv::Vec4d _plane_coef, cv::Mat &_feature_patch, const uint &SPATIAL_RADIUS );
-    uint sampleCubeEvenly( const cv::Point3f &_pt3d, const cv::Vec4d _plane_coef, std::vector<cv::Vec3i> &_cube, const uint &SPATIAL_RADIUS, const double &_main_angle=0 );
+    uint calcPt6d(const cv::Point& _pt, cv::Point3f &_pt3d, cv::Vec4d &_plane_coef, double &_plane_err ) const;
+    uint warpPerspectivePatch(const cv::Point& _pt2d, const cv::Point3f &_pt3d, const cv::Vec4d _plane_coef, cv::Mat &_feature_patch) const;
+    uint sampleCubeEvenly(const cv::Point3f &_pt3d, const cv::Vec4d _plane_coef, std::vector<cv::Vec3i> &_cube, const double &_main_angle=0 ) const;
     std::vector<cv::Vec3i> PyramidCube(const std::vector<cv::Vec3i> &_cube_hi_res );
     uint calcFeatureDir(const cv::Mat& _feature_patch, cv::Point2d &_main_dir, const double& _dense_thresh=0.2);
     uint generateFeatureCode(const cv::Mat& _feature_patch, const cv::Point2d &_main_dir, cv::Mat& _color_code, const double& _dense_thresh=0.2);
@@ -157,8 +158,10 @@ public:
     cv::Mat descriptors_;
     uint height;
     uint width;
-    const uint PATCH_SIZE;          //The feature patches are normalized to the same size
-    uint SPATIAL_R;                 //The main parameter. unit:mm
+    const int PATCH_SIZE;          //The feature patches are normalized to the same size
+    int SPATIAL_R;                 //The main parameter. unit:mm
+    int W2P_RATIO_256;// World to Pixel transformation: mm->pixel (with the sacle of 256)
+    std::vector<int> blur_r_;    //A 3D point is projected to the 2D image with a specified 2D size, which relates to the depth.
 
 private:
     std::vector<cv::KeyPoint> keypoints_filtered_;
@@ -240,7 +243,7 @@ class CV_EXPORTS_W PIFTMatcher : public cv::DescriptorMatcher
 public:
     CV_WRAP PIFTMatcher( const ColorCoding::METHOD &_method, const bool &_cross_check=true ):color_encoder_(_method), cross_check_(_cross_check){}
     virtual ~PIFTMatcher(){}
-    CV_WRAP void matchDescriptors( const cv::Mat& queryDescriptors, const cv::Mat& trainDescriptors, CV_OUT std::vector<cv::DMatch>& matches ) const;
+    CV_WRAP void matchDescriptors( const cv::Mat& _queryDescriptors, const cv::Mat& _trainDescriptors, CV_OUT std::vector<std::vector<cv::DMatch>>& _matches ) const;
     virtual bool isMaskSupported() const { return false; }
     virtual cv::Ptr<cv::DescriptorMatcher> clone( bool emptyTrainData=false ) const;
 

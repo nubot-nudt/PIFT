@@ -10,6 +10,7 @@
 #include <pcl/keypoints/sift_keypoint.h>
 #include <pcl/features/pfh.h>
 #include <pcl/features/fpfh.h>
+#include <pcl/features/shot.h>
 #include <pcl/features/normal_3d.h>
 #include <pcl/features/range_image_border_extractor.h>
 #include <pcl/registration/icp.h>
@@ -242,7 +243,7 @@ getMatchsByTransform( const std::vector<Pointxyz> &_from, const std::vector<Poin
 }
 
 template<class Pointxyz> static cv::Mat
-extractFPFH( std::vector<cv::KeyPoint> _keypoints, const boost::shared_ptr<pcl::PointCloud<Pointxyz> > _cloud )
+extractFPFH( std::vector<cv::KeyPoint> _keypoints, const boost::shared_ptr<pcl::PointCloud<Pointxyz> > _cloud, timeval *_time_start )
 {
 
     const uint min_res    = 15;//mm
@@ -287,6 +288,7 @@ extractFPFH( std::vector<cv::KeyPoint> _keypoints, const boost::shared_ptr<pcl::
     key_points3->resize( valid_cnt );
     _keypoints = keypoints_filtered_;
     /// 3. Feature-Descriptor
+    gettimeofday(_time_start,NULL);
     pcl::FPFHEstimation<Pointxyz, pcl::Normal, pcl::FPFHSignature33> pfh_est;
     boost::shared_ptr<pcl::search::KdTree<Pointxyz> > tree_pfh ( new pcl::search::KdTree<Pointxyz> );
     pfh_est.setSearchMethod (tree_pfh);
@@ -300,6 +302,69 @@ extractFPFH( std::vector<cv::KeyPoint> _keypoints, const boost::shared_ptr<pcl::
     cv::Mat descriptors_( fpfh_signature->size(), 33, CV_32F );
     for( int i = 0; i < fpfh_signature->size(); i++)
         memcpy( descriptors_.data+descriptors_.step[0]*i, fpfh_signature->at(i).histogram, sizeof(pcl::FPFHSignature33) );
+    return descriptors_;
+}
+
+template<class Pointxyzrgb> static cv::Mat
+extractCSHOT( std::vector<cv::KeyPoint> _keypoints, const boost::shared_ptr<pcl::PointCloud<Pointxyzrgb> > _cloud, timeval *_time_start )
+{
+
+    const uint min_res    = 15;//mm
+    const uint norm_r     = 75;
+    const uint feature_r  = 200;
+
+    /// 1. preprocess
+    //remove NAN-Points
+    std::vector<int> indices;
+    pcl::PointCloud<Pointxyzrgb> cloud_ds;
+    pcl::removeNaNFromPointCloud ( *_cloud, cloud_ds, indices);
+    //Downsampling
+    pcl::VoxelGrid<Pointxyzrgb> grid;
+    grid.setLeafSize ( min_res, min_res, min_res );//mm
+    grid.setInputCloud ( cloud_ds.makeShared() );
+    grid.filter ( cloud_ds );
+    // Normal-Estimation
+    pcl::PointCloud<pcl::Normal>::Ptr norms (new pcl::PointCloud<pcl::Normal>);
+    boost::shared_ptr<pcl::search::KdTree<Pointxyzrgb> > tree ( new pcl::search::KdTree<Pointxyzrgb> );
+    pcl::NormalEstimation<Pointxyzrgb, pcl::Normal> ne;
+    ne.setInputCloud ( cloud_ds.makeShared() );
+    ne.setSearchSurface ( _cloud );
+    ne.setSearchMethod ( tree );
+    ne.setRadiusSearch ( norm_r );//mm
+    ne.compute (*norms);
+
+    /// 2. Keypoints 3D
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr key_points3( new pcl::PointCloud<pcl::PointXYZRGB>(1,_keypoints.size()) );
+    std::vector<cv::KeyPoint> keypoints_filtered_;
+    keypoints_filtered_.reserve( _keypoints.size() );
+    int valid_cnt = 0;
+    for( int i = 0; i < (int)_keypoints.size(); i++)
+    {
+        const pcl::PointXYZRGB &pt = _cloud->at(_keypoints[i].pt.x,_keypoints[i].pt.y);
+        if( pt.z!=0 && std::isfinite(pt.z) )
+        {
+            key_points3->at(valid_cnt) = pt;
+            keypoints_filtered_.push_back( _keypoints[i] );
+            valid_cnt ++;
+        }
+    }
+    key_points3->resize( valid_cnt );
+    _keypoints = keypoints_filtered_;
+    /// 3. Feature-Descriptor
+    gettimeofday(_time_start,NULL);
+    pcl::SHOTColorEstimation<Pointxyzrgb,pcl::Normal,pcl::SHOT1344> cshot_est;
+    boost::shared_ptr<pcl::search::KdTree<Pointxyzrgb> > tree_pfh ( new pcl::search::KdTree<Pointxyzrgb> );
+    cshot_est.setSearchMethod (tree_pfh);
+    cshot_est.setRadiusSearch ( feature_r );//mm
+    cshot_est.setSearchSurface (cloud_ds.makeShared());
+    cshot_est.setInputNormals (norms);
+    cshot_est.setInputCloud ( key_points3 );
+    pcl::PointCloud<pcl::SHOT1344>::Ptr fpfh_signature (new pcl::PointCloud<pcl::SHOT1344>);
+    cshot_est.compute (*fpfh_signature);
+
+    cv::Mat descriptors_( fpfh_signature->size(), 1344, CV_32F );// pcl::SHOT1344 contains 1344+9 float, where the ReferenceFrame occupies 9
+    for( int i = 0; i < fpfh_signature->size(); i++)
+        memcpy( descriptors_.data+descriptors_.step[0]*i, fpfh_signature->at(i).descriptor, 1344*sizeof(float) );
     return descriptors_;
 }
 
