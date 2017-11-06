@@ -31,8 +31,8 @@
  *  POSSIBILITY OF SUCH DAMAGE.
  *
  **********************************************************************/
-#ifndef COLOR_CODED_DEPTH_FEATURE_H
-#define COLOR_CODED_DEPTH_FEATURE_H
+#ifndef PIFT_H
+#define PIFT_H
 //PCL includes
 #include <pcl/common/time.h>
 #include <pcl/common/transforms.h>
@@ -42,6 +42,7 @@
 
 //OpenCV includes
 #include <opencv2/opencv.hpp>
+//#include <opencv2/xfeatures2d.hpp>
 #include "opencv2/nonfree/nonfree.hpp"
 #include <string>
 #include <sstream>
@@ -118,6 +119,9 @@ public:
 class PerspectiveInvariantFeature
 {
 public:
+    bool TEST_NOT_USE_PROJECTION   = false;//used for reviewer #7 about the Ablation study
+    bool TEST_NOT_USE_FAKE_FILTER  = false;//used for reviewer #7 about the Ablation study
+    bool TEST_NOT_USE_COLOR_CODING = false;//used for reviewer #7 about the Ablation study
     enum DESCRIPTOR_TYPE
     {
         D_TYPE_BEEHIVE = 0,
@@ -144,7 +148,7 @@ public:
     bool prepareFrame( const cv::Mat _rgb_image, const cv::Mat _depth_16U );
     void setDrawResults( const bool _draw_result=false ){ DRAW_IMAG = _draw_result; }
 
-    uint calcPt6d(const cv::Point& _pt, cv::Point3f &_pt3d, cv::Vec4d &_plane_coef, double &_plane_err ) const;
+    uint calcPt6d(const cv::Point& _pt, cv::Point3f &_pt3d, cv::Vec4d &_plane_coef, double &_plane_curvature ) const;
     uint warpPerspectivePatch(const cv::Point& _pt2d, const cv::Point3f &_pt3d, const cv::Vec4d _plane_coef, cv::Mat &_feature_patch) const;
     uint sampleCubeEvenly(const cv::Point3f &_pt3d, const cv::Vec4d _plane_coef, std::vector<cv::Vec3i> &_cube, const double &_main_angle=0 ) const;
     std::vector<cv::Vec3i> PyramidCube(const std::vector<cv::Vec3i> &_cube_hi_res );
@@ -243,7 +247,7 @@ class CV_EXPORTS_W PIFTMatcher : public cv::DescriptorMatcher
 public:
     CV_WRAP PIFTMatcher( const ColorCoding::METHOD &_method, const bool &_cross_check=true ):color_encoder_(_method), cross_check_(_cross_check){}
     virtual ~PIFTMatcher(){}
-    CV_WRAP void matchDescriptors( const cv::Mat& _queryDescriptors, const cv::Mat& _trainDescriptors, CV_OUT std::vector<std::vector<cv::DMatch>>& _matches ) const;
+    CV_WRAP void matchDescriptors( const cv::Mat& _queryDescriptors, const cv::Mat& _trainDescriptors, CV_OUT std::vector<std::vector<cv::DMatch> >& _matches ) const;
     virtual bool isMaskSupported() const { return false; }
     virtual cv::Ptr<cv::DescriptorMatcher> clone( bool emptyTrainData=false ) const;
 
@@ -257,4 +261,4 @@ protected:
     ColorCoding color_encoder_;
     bool cross_check_;
 };
-#endif
+#endif //PIFT_H

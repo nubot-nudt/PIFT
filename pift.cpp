@@ -617,7 +617,7 @@ PerspectiveInvariantFeature::PerspectiveInvariantFeature(const uint _max_keypoin
     features_restore_.create( 10*PATCH_SIZE, 10*PATCH_SIZE, CV_8UC4);
 }
 
-uint PerspectiveInvariantFeature::calcPt6d(const cv::Point& _pt, cv::Point3f &_pt3d, cv::Vec4d &_plane_coef, double &_plane_err ) const
+uint PerspectiveInvariantFeature::calcPt6d(const cv::Point& _pt, cv::Point3f &_pt3d, cv::Vec4d &_plane_coef, double &_plane_curvature ) const
 {//_plan_coef: Ax+By+Cz=D; return num of pixels
 
     const bool SHOW_TIME_INFO = false;
@@ -725,7 +725,7 @@ uint PerspectiveInvariantFeature::calcPt6d(const cv::Point& _pt, cv::Point3f &_p
     _plane_coef[1] = plane_norm.normal_y;
     _plane_coef[2] = plane_norm.normal_z;
     _plane_coef[3] = surface_pt.x*_plane_coef[0]+surface_pt.y*_plane_coef[1]+surface_pt.z*_plane_coef[2];
-    _plane_err = plane_norm.curvature;
+    _plane_curvature = 1.0/plane_norm.curvature;
 
     /// 5. calculate the accurate 3D coordinates of the keypoint
     float pt_xn = (_pt.x-camera_cx + 0.5) * _1_camera_fx;
@@ -1097,7 +1097,7 @@ uint PerspectiveInvariantFeature::calcFeatureDir(const cv::Mat& _feature_patch, 
                 else_cnt ++;
         }
     }
-    if( main_cnt > annular_mask_->ANGLE_RES*0.35 && else_cnt <= 2 )
+    if( main_cnt > annular_mask_->ANGLE_RES*0.35 && else_cnt <= 2 )//fake keypoint check
     {
 //        double cos_theta = valid_dir_vec.dot( main_dir_vec ) / hypot(valid_dir_vec.x,valid_dir_vec.y) / hypot(main_dir_vec.x,main_dir_vec.y);
 //        if( fabs(cos_theta)>cos(M_PI/9) )// The main direction and the valid direction are the same, means the color are even along the border.
@@ -1271,7 +1271,7 @@ PerspectiveInvariantFeature::prepareFrame( const cv::Mat _rgb_image, const cv::M
     {
         normals_ = (pcl::PointCloud<pcl::Normal>::Ptr) new pcl::PointCloud<pcl::Normal>;
         normal_est_ = (pcl::IntegralImageNormalEstimation<pcl::PointXYZRGB,pcl::Normal>::Ptr) new pcl::IntegralImageNormalEstimation<pcl::PointXYZRGB,pcl::Normal>;
-        normal_est_->setNormalEstimationMethod( normal_est_->AVERAGE_3D_GRADIENT);
+        normal_est_->setNormalEstimationMethod( normal_est_->COVARIANCE_MATRIX);//AVERAGE_3D_GRADIENT
         normal_est_->setMaxDepthChangeFactor( SPATIAL_R );//threshold for computing object borders
         normal_est_->setNormalSmoothingSize( 50 );//unit: pixel
     }
@@ -1286,7 +1286,6 @@ PerspectiveInvariantFeature::prepareFrame( const cv::Mat _rgb_image, const cv::M
 
     return true;
 }
-
 cv::Mat
 PerspectiveInvariantFeature::process( std::vector<cv::KeyPoint> &m_keypoints )
 {
@@ -1313,11 +1312,11 @@ PerspectiveInvariantFeature::process( std::vector<cv::KeyPoint> &m_keypoints )
         cv::Point3f keypoint3d;
         cv::Mat cur_patch;
         cv::Vec4d plan_coef(0,0,0,0);//Ax+By+Cz=D ,(A B C) is the normal vector
-        double plane_err;
+        double plane_curvature;
         cur_patch = cv::Mat::zeros( PATCH_SIZE, PATCH_SIZE, CV_8UC4 );
 
         uint front_pt_num;
-        front_pt_num = calcPt6d( keypoint2d, keypoint3d, plan_coef, plane_err );//0.03ms
+        front_pt_num = calcPt6d( keypoint2d, keypoint3d, plan_coef, plane_curvature );//0.03ms
         if( !front_pt_num  )
         {
             fake_point_cnt[0] ++;
@@ -1326,27 +1325,32 @@ PerspectiveInvariantFeature::process( std::vector<cv::KeyPoint> &m_keypoints )
             continue;
         }
 
-//        float &r = m_keypoints[key_id].size;
-//        if( r != 0 )
-//            spatial_r = r * _1_camera_fx * keypoint3d.z;
-        warpPerspectivePatch( keypoint2d, keypoint3d, plan_coef, cur_patch );
-        if( 0)//fabs(plan_coef[2]) < sin(M_PI/20) && keypoint3d.z>1000 )//Steep surface
+        if(TEST_NOT_USE_PROJECTION)
+        {
+            cv::Rect roi( keypoint2d.x-PATCH_SIZE/2, keypoint2d.y-PATCH_SIZE/2, PATCH_SIZE, PATCH_SIZE );
+            cv::cvtColor( cv::Mat(rgb_img_, roi), cur_patch, CV_BGR2BGRA );
+        }
+        else
+            warpPerspectivePatch( keypoint2d, keypoint3d, plan_coef, cur_patch );
+        bool is_fake = fabs(plan_coef[2]) < sin(M_PI/20) && plane_curvature<SPATIAL_R;
+        if( is_fake && !TEST_NOT_USE_FAKE_FILTER )
         {
             fake_point_cnt[1] ++;
 //            std::cout<< "\t\t\t\t\tPoint at curve."<< std::endl;
-            if( DRAW_IMAG ) cv::circle(rgb_show_,  keypoint2d,2,CV_RGB(255,255,0),CV_FILLED );
+            if( DRAW_IMAG ) cv::circle(rgb_show_,  keypoint2d,2,CV_RGB(255,0,255),CV_FILLED );
             continue;
         }
 
         ///2. calculate the main direction of the feature patch
         cv::Point2d main_dir_vec(1,0);
-        if( !calcFeatureDir( cur_patch, main_dir_vec ) )
+        is_fake = !calcFeatureDir( cur_patch, main_dir_vec );
+        if( is_fake && !TEST_NOT_USE_FAKE_FILTER )
         {
 //            if( DRAW_IMAG ) cv::circle(rgb_show_,  keypoint2d,2,CV_RGB(100,100,255),CV_FILLED );
 //            cv::imshow( "img", rgb_show_ );
 //            cv::imshow( "fake point", cur_patch );
 //            cv::waitKey();
-            if( DRAW_IMAG ) cv::circle(rgb_show_,  keypoint2d,2,CV_RGB(0,0,255),CV_FILLED );
+            if( DRAW_IMAG ) cv::circle(rgb_show_,  keypoint2d,2,CV_RGB(255,0,255),CV_FILLED );
             fake_point_cnt[2] ++;
             continue;
         }
