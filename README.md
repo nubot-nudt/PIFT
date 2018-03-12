@@ -4,7 +4,7 @@
   
   This project cantians the basic implementation and the interfaces of PIFT, in the files of pift.h and pift.cpp. The demonstration of extracting PIFT features and feature maching is also provided in this project.
   
-  Maintainer: NuBot workshop, NUDT China - http://nubot.trustie.com and https://github.com/nubot-nudt
+  Maintainer: NuBot workshop, NUDT China - http://nubot.trustie.net and https://github.com/nubot-nudt
 ## Requirements
   OpenCV 2.X
   
